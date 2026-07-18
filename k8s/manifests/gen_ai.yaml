@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gen-ai
+  labels:
+    app: gen-ai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gen-ai
+  template:
+    metadata:
+      labels:
+        app: gen-ai
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: gen-ai
+        image: 192.168.100.3:5000/gen-ai:ollama-fallback-v1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        # ── Gen-AI Model Selection ──────────────────────────────────────────────────
+        # Valid VARIANT_ID options (from src/variant_catalog.py):
+        # Quality values are benchmarked scores — source of truth: GEN_AI_OFFLINE_QUALITY
+        #
+        # 1. "qwen-1.5b-nano"  [DEFAULT]
+        #    - Ollama model: qwen2.5:1.5b
+        #    - Quality: 0.50 (benchmarked)  ← variant_catalog.GEN_AI_OFFLINE_QUALITY
+        #    - Latency: ~150ms (mock) / ~1500ms (ollama)
+        #    - CPU scale: 1.0x | RAM scale: 1.0x
+        #    → FAST & CHEAP, good for energy_saving scenarios
+        #
+        # 2. "llama-3b-small"
+        #    - Ollama model: llama3.2:3b
+        #    - Quality: 0.63 (benchmarked)  ← variant_catalog.GEN_AI_OFFLINE_QUALITY
+        #    - Latency: ~420ms (mock) / ~2000ms (ollama)
+        #    - CPU scale: 2.0x | RAM scale: 2.0x
+        #    → BALANCED, good for standard scenarios
+        #
+        # 3. "gemma2-2b-medium"
+        #    - Ollama model: gemma2:2b
+        #    - Quality: 0.52 (benchmarked)  ← variant_catalog.GEN_AI_OFFLINE_QUALITY
+        #    - Latency: ~760ms (mock) / ~3300ms (ollama)
+        #    - CPU scale: 1.33x | RAM scale: 1.4x
+        #    → COMPUTE-HEAVY variant (slower, not highest quality on this benchmark)
+        #
+        # Quick switch: kubectl set env deployment/gen-ai VARIANT_ID=llama-3b-small
+        #
+        - name: SERVICE_NAME
+          value: "gen-ai"
+        - name: VARIANT_ID
+          value: "qwen-1.5b-nano" 
+        - name: GEN_AI_MODE
+          value: "ollama"
+          # Options: "mock" (fake reports, fast) | "ollama" (real LLM inference)
+        - name: OLLAMA_URL
+          value: "http://192.168.100.3:11434"
+          # In-cluster: "http://ollama:11434" | External: "http://192.168.100.3:11434"
+        - name: OLLAMA_MODEL
+          # Must match deployed Ollama model name. Auto-resolved from VARIANT_ID:
+          # "qwen-1.5b-nano" → "qwen2.5:1.5b"
+          # "llama-3b-small" → "llama3.2:3b"
+          # "gemma2-2b-medium" → "gemma2:2b"
+          value: "qwen2.5:1.5b"
+        - name: OLLAMA_TIMEOUT_S
+          value: "55"
+        - name: GEN_AI_FALLBACK_ON_ERROR
+          value: "true"
+        - name: GEN_AI_SAMPLING_RATE
+          value: "1"
+          # Process 1 out of N frames. Options: 1 (always), 3 (33%), 5 (20%), etc.
+          # Higher = more frames skipped = less resource / latency (but less accuracy)
+        - name: MY_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]
+        resources:
+          requests:
+            cpu: "300m"
+            memory: "512Mi"
+          limits:
+            cpu: "1500m"
+            memory: "4Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gen-ai
+spec:
+  selector:
+    app: gen-ai
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP

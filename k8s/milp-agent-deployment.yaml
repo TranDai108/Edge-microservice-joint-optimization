@@ -1,0 +1,259 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milp-agent
+  namespace: default
+spec:
+  # HA: 2 replicas — one active leader, one hot standby.
+  # Leader election (coordination.k8s.io Lease "milp-leader") ensures only
+  # the leader writes placements.  The standby stays ready to take over
+  # within seconds without an operator restart.
+  replicas: 2
+  strategy:
+    # RollingUpdate guarantees at least 1 pod serving at all times during
+    # upgrades, honouring the disruption-aware rolling-update pattern.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: milp-agent
+  template:
+    metadata:
+      labels:
+        app: milp-agent
+    spec:
+      serviceAccountName: milp-agent-sa
+      # Remove hard nodeName pinning — use nodeSelector with preferred fallback
+      # so the scheduler can place standby pods on any available edge node.
+      nodeSelector:
+        node-role.kubernetes.io/edge: "true"
+      affinity:
+        podAntiAffinity:
+          # Strong preference: spread replicas across different nodes to
+          # survive a single-node failure.
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: milp-agent
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          # Last-resort fallback: allow control-plane node if no edge node
+          # is available, keeping controller availability during edge failures.
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+      containers:
+      - name: milp-agent
+        image: 192.168.100.3:5000/milp-agent:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        # ── Redis Sentinel discovery (replaces single-host REDIS_HOST) ──────
+        - name: REDIS_SENTINEL_HOSTS
+          value: "redis-sentinel.default.svc.cluster.local:26379"
+        - name: REDIS_SENTINEL_MASTER
+          value: "mymaster"
+        # Keep REDIS_HOST for backward-compat fallback path in code
+        - name: REDIS_HOST
+          value: redis.default.svc.cluster.local
+        - name: CONTROL_INTERVAL
+          value: "10"
+        - name: PROM_URL
+          value: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/api/v1/query
+        - name: MILP_W_C
+          value: "0.20"
+        - name: MILP_W_D
+          value: "0.10"
+        - name: MILP_W_A
+          value: "0.70"
+        # ── Leader election config ───────────────────────────────────────────
+        - name: LEADER_LEASE_NAME
+          value: "milp-leader"
+        - name: LEADER_LEASE_NAMESPACE
+          value: "default"
+        - name: LEADER_LEASE_DURATION_S
+          value: "15"
+        - name: LEADER_RENEW_DEADLINE_S
+          value: "10"
+        - name: LEADER_RETRY_PERIOD_S
+          value: "2"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 500m
+          limits:
+            memory: 1Gi
+            cpu: 1000m
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milp-agent
+  namespace: default
+spec:
+  selector:
+    app: milp-agent
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# PodDisruptionBudget: at most 1 MILP pod unavailable at any time, so the
+# standby is not evicted while the leader is terminating (e.g. during node
+# maintenance or rolling updates).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: milp-agent-pdb
+  namespace: default
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: milp-agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: milp-agent-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: milp-agent-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: milp-agent-binding
+subjects:
+- kind: ServiceAccount
+  name: milp-agent-sa
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: milp-agent-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ── Variant Controller (HA) ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: variant-controller
+  namespace: default
+spec:
+  # 2 replicas with leader election via "variant-controller-leader" Lease.
+  # Only the leader executes rollouts; the standby watches and waits.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: variant-controller
+  template:
+    metadata:
+      labels:
+        app: variant-controller
+    spec:
+      serviceAccountName: milp-agent-sa
+      # Remove hard nodeName pinning — any edge node is acceptable
+      nodeSelector:
+        node-role.kubernetes.io/edge: "true"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: variant-controller
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: variant-controller
+        image: 192.168.100.3:5000/milp-agent:latest
+        imagePullPolicy: Always
+        command: ["python", "variant_controller/variant_controller.py"]
+        env:
+        - name: REDIS_SENTINEL_HOSTS
+          value: "redis-sentinel.default.svc.cluster.local:26379"
+        - name: REDIS_SENTINEL_MASTER
+          value: "mymaster"
+        - name: REDIS_HOST
+          value: redis.default.svc.cluster.local
+        - name: REGISTRY
+          value: "192.168.100.3:5000"
+        - name: RECONCILE_INTERVAL_S
+          value: "20"
+        - name: DEFAULT_ROLLOUT_TIMEOUT_S
+          value: "45"
+        - name: MANAGED_SERVICES
+          value: "api-gateway,ingest,preprocess,detection,gen-ai,postprocess"
+        - name: LEADER_LEASE_NAME
+          value: "variant-controller-leader"
+        - name: LEADER_LEASE_NAMESPACE
+          value: "default"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 100m
+          limits:
+            memory: 256Mi
+            cpu: 300m
+        readinessProbe:
+          exec:
+            command: ["python", "-c", "from ha.redis_client import make_redis_client; make_redis_client().ping()"]
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 5
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: variant-controller-pdb
+  namespace: default
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: variant-controller

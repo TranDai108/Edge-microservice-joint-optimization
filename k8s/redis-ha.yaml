@@ -1,0 +1,285 @@
+# Redis HA — Primary + Replica + Sentinel
+#
+# Replaces the single redis-deployment.yaml with a 3-pod Sentinel setup.
+# Sentinel provides automatic leader election and client discovery so that
+# controller clients can always find the current primary via Sentinel even
+# after a primary failure.
+#
+# Topology:
+#   redis-primary   (1 pod, StatefulSet)
+#   redis-replica   (1 pod, StatefulSet)
+#   redis-sentinel  (1 pod, Deployment — quorum=2 with standalone Sentinel OK for 2-node)
+#
+# Clients connect to: redis-sentinel.default.svc.cluster.local:26379
+# and ask for master "mymaster" to get the current primary address.
+#
+# Apply:
+#   kubectl delete -f k8s/redis-deployment.yaml --ignore-not-found
+#   kubectl apply -f k8s/redis-ha.yaml
+---
+# ── Headless service for StatefulSet DNS ──────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: default
+  labels:
+    app: redis-ha
+spec:
+  clusterIP: None
+  selector:
+    app: redis-ha
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+---
+# ── Client-facing service (routes to primary only via label selector) ─────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: default
+  labels:
+    app: redis-ha
+spec:
+  selector:
+    app: redis-ha
+    redis-current-role: primary
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+---
+# ── Sentinel discovery service ────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: default
+  labels:
+    app: redis-sentinel
+spec:
+  selector:
+    app: redis-sentinel
+  ports:
+  - name: sentinel
+    port: 26379
+    targetPort: 26379
+---
+# ── ConfigMap: sentinel configuration ────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-sentinel-config
+  namespace: default
+data:
+  sentinel.conf: |
+    # Monitor the primary; quorum=1 (single Sentinel pod acceptable in lab)
+    sentinel monitor mymaster redis-primary-0.redis-headless.default.svc.cluster.local 6379 1
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 30000
+    sentinel parallel-syncs mymaster 1
+    # Re-announce after failover so clients learn new primary
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+---
+# ── Primary StatefulSet ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-primary
+  namespace: default
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-ha
+      redis-role: primary
+  template:
+    metadata:
+      labels:
+        app: redis-ha
+        redis-role: primary
+        redis-current-role: primary
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: redis-ha
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server", "--save", "60", "1", "--loglevel", "notice"]
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 50m
+          limits:
+            memory: 256Mi
+            cpu: 300m
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 15
+          periodSeconds: 15
+---
+# ── Replica StatefulSet ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-replica
+  namespace: default
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-ha
+      redis-role: replica
+  template:
+    metadata:
+      labels:
+        app: redis-ha
+        redis-role: replica
+        redis-current-role: replica
+    spec:
+      affinity:
+        podAntiAffinity:
+          # Strong preference: replica on different node from primary
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: redis-ha
+                  redis-role: primary
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command:
+        - redis-server
+        - "--replicaof"
+        - "redis-primary-0.redis-headless.default.svc.cluster.local"
+        - "6379"
+        - "--loglevel"
+        - "notice"
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: 64Mi
+            cpu: 50m
+          limits:
+            memory: 256Mi
+            cpu: 200m
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 20
+          periodSeconds: 15
+---
+# ── Sentinel Deployment ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-sentinel
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-sentinel
+  template:
+    metadata:
+      labels:
+        app: redis-sentinel
+    spec:
+      # Prefer different node from primary for true fault isolation
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: redis-ha
+                  redis-role: primary
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+      # Wait for primary to be ready before starting Sentinel
+      - name: wait-for-primary
+        image: redis:7-alpine
+        command:
+        - sh
+        - -c
+        - |
+          until redis-cli -h redis-primary-0.redis-headless.default.svc.cluster.local ping; do
+            echo "Waiting for redis primary..."; sleep 2;
+          done
+      containers:
+      - name: sentinel
+        image: redis:7-alpine
+        command:
+        - sh
+        - -c
+        - |
+          cp /etc/redis-sentinel/sentinel.conf /tmp/sentinel.conf
+          redis-sentinel /tmp/sentinel.conf
+        ports:
+        - containerPort: 26379
+        volumeMounts:
+        - name: sentinel-config
+          mountPath: /etc/redis-sentinel
+        resources:
+          requests:
+            memory: 32Mi
+            cpu: 25m
+          limits:
+            memory: 64Mi
+            cpu: 100m
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "-p", "26379", "ping"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "-p", "26379", "ping"]
+          initialDelaySeconds: 20
+          periodSeconds: 15
+      volumes:
+      - name: sentinel-config
+        configMap:
+          name: redis-sentinel-config
+---
+# ── PodDisruptionBudget: prevent both Redis pods evicted simultaneously ────────
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-ha-pdb
+  namespace: default
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: redis-ha

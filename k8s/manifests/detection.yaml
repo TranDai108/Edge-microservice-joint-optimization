@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detection
+  labels:
+    app: detection
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: detection
+  template:
+    metadata:
+      labels:
+        app: detection
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: detection
+        image: 192.168.100.3:5000/detection:yolo26-nano   # controller patches this
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: SERVICE_NAME
+          value: "detection"
+        - name: VARIANT_ID
+          value: "yolo26-nano"
+        - name: ALLOW_MODEL_DISCOVERY
+          value: "false"
+        - name: MY_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CONF_THRESHOLD
+          value: "0.25"
+        - name: IOU_THRESHOLD
+          value: "0.45"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "800Mi"
+          limits:
+            cpu: "1400m"
+            memory: "2Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: detection
+spec:
+  selector:
+    app: detection
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP

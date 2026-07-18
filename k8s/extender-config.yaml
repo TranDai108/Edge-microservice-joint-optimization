@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milp-extender-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    apiVersion: kubescheduler.config.k8s.io/v1
+    kind: KubeSchedulerConfiguration
+    profiles:
+    - schedulerName: default-scheduler
+    extenders:
+    - urlPrefix: http://milp-agent.default.svc.cluster.local:8080
+      filterVerb: filter
+      prioritizeVerb: prioritize
+      weight: 100
+      enableHTTPS: false
+      nodeCacheCapable: false
+      # 5 s timeout: extender stalls are bounded; scheduler continues without
+      # extender scores after this window (ignorable: true guarantees this).
+      httpTimeout: 5s
+      # ignorable: true is the primary resilience guarantee — if the extender
+      # is unreachable (all controller pods down, network partition, etc.) the
+      # kube-scheduler falls back to its own built-in scoring plugins (default
+      # K8s scoring) and continues scheduling normally.  No scheduler stall.
+      ignorable: true
+      managedResources: []
+    - urlPrefix: http://drl-agent.default.svc.cluster.local:8001
+      filterVerb: filter
+      prioritizeVerb: prioritize
+      weight: 100
+      enableHTTPS: false
+      nodeCacheCapable: false
+      # DRL extender returns neutral scores (50) when MILP heartbeat is alive
+      # so it does not interfere with MILP scoring in normal operation.
+      # When milp-agent is down, DRL activates its own node_scores from
+      # drl:placement so pods are still placed on DRL-preferred nodes.
+      httpTimeout: 5s
+      ignorable: true
+      managedResources: []

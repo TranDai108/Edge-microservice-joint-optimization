@@ -1,0 +1,293 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-kltn-pipeline-milp
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  kltn-pipeline-milp.json: |
+    {
+      "uid": "kltn-pipeline-milp",
+      "title": "KLTN Pipeline QoS & MILP Decisions",
+      "tags": ["kltn", "pipeline", "milp", "qos"],
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "timezone": "browser",
+      "editable": true,
+      "graphTooltip": 1,
+      "time": {
+        "from": "now-30m",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "service",
+            "type": "query",
+            "datasource": "Prometheus",
+            "query": "label_values(service_requests_total, service)",
+            "includeAll": true,
+            "multi": true,
+            "allValue": ".*",
+            "refresh": 2,
+            "sort": 1,
+            "current": {
+              "selected": true,
+              "text": "All",
+              "value": ".*"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Pipeline Throughput (req/s)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(service_requests_total{service=\"api-gateway\",status=\"success\"}[5m]))"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "decimals": 3
+            }
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Pipeline Error Rate (%)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "100 * sum(rate(service_requests_total{service=\"api-gateway\",status!=\"success\"}[5m])) / clamp_min(sum(rate(service_requests_total{service=\"api-gateway\"}[5m])), 0.0001)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "decimals": 2
+            }
+          }
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Gateway E2E P95 Latency (ms)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by(le) (rate(e2e_latency_ms_bucket[5m])))"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "decimals": 1
+            }
+          }
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Detection Model Loaded",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max(detection_model_loaded)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "max": 1,
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {"text": "NOT LOADED", "color": "red"},
+                    "1": {"text": "LOADED", "color": "green"}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Service Request Rate by Status (req/s)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by(service, status) (rate(service_requests_total{service=~\"$service\"}[5m]))",
+              "legendFormat": "{{service}} {{status}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            }
+          }
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Service P95 Latency (ms)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by(service, le) (rate(service_latency_ms_bucket{service=~\"$service\"}[5m])))",
+              "legendFormat": "{{service}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms"
+            }
+          }
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Gateway E2E Latency (P50/P95, ms)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.50, sum by(le) (rate(e2e_latency_ms_bucket[5m])))",
+              "legendFormat": "P50"
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.95, sum by(le) (rate(e2e_latency_ms_bucket[5m])))",
+              "legendFormat": "P95"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms"
+            }
+          }
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Detection Quality (Mean Confidence)",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by(variant) (rate(detection_accuracy_sum[5m])) / clamp_min(sum by(variant) (rate(detection_accuracy_count[5m])), 0.0001)",
+              "legendFormat": "{{variant}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 3
+            }
+          }
+        },
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Average Objects per Frame",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by(variant) (rate(detection_object_count_sum[5m])) / clamp_min(sum by(variant) (rate(detection_object_count_count[5m])), 0.0001)",
+              "legendFormat": "{{variant}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "decimals": 2
+            }
+          }
+        },
+        {
+          "id": 10,
+          "type": "table",
+          "title": "Current Pipeline Pod Placement",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+          "targets": [
+            {
+              "refId": "A",
+              "format": "table",
+              "instant": true,
+              "expr": "kube_pod_info{pod=~\"(api-gateway|ingest|preprocess|detection|postprocess|milp-agent|variant-controller).*\"}"
+            }
+          ],
+          "options": {
+            "showHeader": true
+          }
+        },
+        {
+          "id": 11,
+          "type": "table",
+          "title": "Detection Runtime Image and Node",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+          "targets": [
+            {
+              "refId": "A",
+              "format": "table",
+              "instant": true,
+              "expr": "kube_pod_container_info{pod=~\"detection.*\",container=\"detection\"}"
+            }
+          ],
+          "options": {
+            "showHeader": true
+          }
+        },
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "Control Plane Pod Restarts",
+          "datasource": "Prometheus",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by(pod) (kube_pod_container_status_restarts_total{pod=~\"(milp-agent|variant-controller).*\"})",
+              "legendFormat": "{{pod}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "min": 0
+            }
+          }
+        }
+      ]
+    }

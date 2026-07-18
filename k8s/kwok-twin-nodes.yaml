@@ -1,0 +1,165 @@
+# KWOK Virtual Twin Nodes — Digital Twin Infrastructure (Tier 2)
+#
+# Creates 4 virtual mirror nodes for edge-nodes-1..4 in the existing K3s
+# cluster using the KWOK controller.  These nodes participate in the real
+# kube-scheduler /filter and /prioritize extender calls, allowing DRL to
+# "dry-run" placements and verify K8s admission before acting on real nodes.
+#
+# Key properties:
+#   • Labelled kwok.x-k8s.io/node=fake  — KWOK controller manages lifecycle
+#   • Tainted NoSchedule for real workloads — DRL test-pods only
+#   • twin-of: <real-node> label — used by twin_sync.py for state bridging
+#   • CPU/mem annotations updated every 15s by twin_sync.py from Redis
+#
+# Apply:
+#   kubectl apply -f k8s/kwok-twin-nodes.yaml
+# Remove:
+#   kubectl delete -f k8s/kwok-twin-nodes.yaml
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: twin-edge-nodes-1
+  labels:
+    type: kwok
+    twin-of: edge-nodes-1
+    node-role.kubernetes.io/edge-twin: "true"
+    beta.kubernetes.io/os: linux
+  annotations:
+    kwok.x-k8s.io/node: fake
+    kwok.x-k8s.io/usage-cpu: "200m"
+    kwok.x-k8s.io/usage-memory: "512Mi"
+spec:
+  taints:
+    - key: kwok.x-k8s.io/node
+      value: fake
+      effect: NoSchedule
+  unschedulable: false
+status:
+  capacity:
+    cpu: "4"
+    memory: "3911Mi"
+    pods: "110"
+  allocatable:
+    cpu: "4"
+    memory: "3911Mi"
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    containerRuntimeVersion: kwok/v0.7.0
+    kernelVersion: 5.15.0-176-generic
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+    osImage: Ubuntu 22.04.5 LTS (twin)
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: twin-edge-nodes-2
+  labels:
+    type: kwok
+    twin-of: edge-nodes-2
+    node-role.kubernetes.io/edge-twin: "true"
+    beta.kubernetes.io/os: linux
+  annotations:
+    kwok.x-k8s.io/node: fake
+    kwok.x-k8s.io/usage-cpu: "200m"
+    kwok.x-k8s.io/usage-memory: "512Mi"
+spec:
+  taints:
+    - key: kwok.x-k8s.io/node
+      value: fake
+      effect: NoSchedule
+  unschedulable: false
+status:
+  capacity:
+    cpu: "2"
+    memory: "3911Mi"
+    pods: "110"
+  allocatable:
+    cpu: "2"
+    memory: "3911Mi"
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    containerRuntimeVersion: kwok/v0.7.0
+    kernelVersion: 5.15.0-176-generic
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+    osImage: Ubuntu 22.04.5 LTS (twin)
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: twin-edge-nodes-3
+  labels:
+    type: kwok
+    twin-of: edge-nodes-3
+    node-role.kubernetes.io/edge-twin: "true"
+    beta.kubernetes.io/os: linux
+  annotations:
+    kwok.x-k8s.io/node: fake
+    kwok.x-k8s.io/usage-cpu: "200m"
+    kwok.x-k8s.io/usage-memory: "512Mi"
+spec:
+  taints:
+    - key: kwok.x-k8s.io/node
+      value: fake
+      effect: NoSchedule
+  unschedulable: false
+status:
+  capacity:
+    cpu: "4"
+    memory: "7937Mi"
+    pods: "110"
+  allocatable:
+    cpu: "4"
+    memory: "7937Mi"
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    containerRuntimeVersion: kwok/v0.7.0
+    kernelVersion: 5.15.0-176-generic
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+    osImage: Ubuntu 22.04.5 LTS (twin)
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: twin-edge-nodes-4
+  labels:
+    type: kwok
+    twin-of: edge-nodes-4
+    node-role.kubernetes.io/edge-twin: "true"
+    beta.kubernetes.io/os: linux
+  annotations:
+    kwok.x-k8s.io/node: fake
+    kwok.x-k8s.io/usage-cpu: "200m"
+    kwok.x-k8s.io/usage-memory: "512Mi"
+spec:
+  taints:
+    - key: kwok.x-k8s.io/node
+      value: fake
+      effect: NoSchedule
+  unschedulable: false
+status:
+  capacity:
+    cpu: "4"
+    memory: "7937Mi"
+    pods: "110"
+  allocatable:
+    cpu: "4"
+    memory: "7937Mi"
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    containerRuntimeVersion: kwok/v0.7.0
+    kernelVersion: 5.15.0-176-generic
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+    osImage: Ubuntu 22.04.5 LTS (twin)

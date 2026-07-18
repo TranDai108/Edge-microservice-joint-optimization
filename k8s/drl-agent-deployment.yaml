@@ -1,0 +1,155 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drl-agent
+  namespace: default
+spec:
+  # HA: 2 replicas — active leader (runs inference + writes drl:placement)
+  # and a hot standby (runs inference loop in observe-only mode until elected).
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: drl-agent
+  template:
+    metadata:
+      labels:
+        app: drl-agent
+    spec:
+      serviceAccountName: milp-agent-sa
+      # Remove hard nodeName pinning; use nodeSelector + preferred anti-affinity
+      nodeSelector:
+        node-role.kubernetes.io/edge: "true"
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: drl-agent
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          # Last-resort: control-plane node if all edge nodes are unavailable
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+      containers:
+      - name: drl-agent
+        image: 192.168.100.3:5000/drl-agent:adaptive-v16
+        imagePullPolicy: Always
+        command: ["python", "drl_agent.py"]
+        ports:
+        - containerPort: 8001
+        env:
+        # ── Redis Sentinel discovery ─────────────────────────────────────────
+        - name: REDIS_SENTINEL_HOSTS
+          value: "redis-sentinel.default.svc.cluster.local:26379"
+        - name: REDIS_SENTINEL_MASTER
+          value: "mymaster"
+        - name: REDIS_HOST
+          value: redis.default.svc.cluster.local
+        - name: REDIS_PORT
+          value: "6379"
+        - name: CONTROL_INTERVAL
+          value: "5"
+        - name: DRL_INFERENCE_INTERVAL_S
+          value: "2.0"
+        # ── Leader election config ───────────────────────────────────────────
+        - name: LEADER_LEASE_NAME
+          value: "drl-leader"
+        - name: LEADER_LEASE_NAMESPACE
+          value: "default"
+        - name: LEADER_LEASE_DURATION_S
+          value: "15"
+        - name: LEADER_RENEW_DEADLINE_S
+          value: "10"
+        - name: LEADER_RETRY_PERIOD_S
+          value: "2"
+        - name: DRL_MODEL_PATH
+          value: "/app/models/drl_ppo.zip"
+        - name: DRL_ALLOWED_CONTRACTS
+          value: "legacy_44,dynamic_96"
+        - name: DRL_DISABLE_ON_UNSUPPORTED
+          value: "true"
+        - name: DRL_EPSILON_FALLBACK
+          value: "0.22"
+        - name: DRL_EPSILON_WINDOW
+          value: "50"
+        - name: DRL_ACTION_STICKY_GUARD_ENABLED
+          value: "true"
+        - name: DRL_ACTION_STICKY_WINDOW
+          value: "12"
+        - name: DRL_ACTION_STICKY_MIN_IMPROVEMENT
+          value: "0.005"
+        - name: DRL_CANDIDATE_RERANK_ENABLED
+          value: "true"
+        - name: DRL_CANDIDATE_RERANK_MODES
+          value: "hybrid"
+        - name: DRL_RERANK_MIN_IMPROVEMENT
+          value: "0.001"
+        - name: DRL_RERANK_INCLUDE_MILP
+          value: "true"
+        - name: DRL_RERANK_INCLUDE_CONFIRMED
+          value: "true"
+        - name: DRL_STORM_PROJECTION_BUDGET
+          value: "2"
+        - name: DRL_STORM_CORRECTION_BUFFER_KEY
+          value: "drl:storm_corrections"
+        - name: DRL_STORM_CORRECTION_MAXLEN
+          value: "5000"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 250m
+          limits:
+            memory: 1Gi
+            cpu: 500m
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drl-agent
+  namespace: default
+spec:
+  selector:
+    app: drl-agent
+  ports:
+  - port: 8001
+    targetPort: 8001
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: drl-agent-pdb
+  namespace: default
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: drl-agent

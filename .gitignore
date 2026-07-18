@@ -1,0 +1,32 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+monitoring/venv_dashboard/
+
+# Editor settings
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Runtime and local outputs
+*.log
+*.pid
+
+.agents
+monitoring_runs
+tests
+
+results/
+tmp/

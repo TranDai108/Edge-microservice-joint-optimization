@@ -1,0 +1,61 @@
+# KWOK Twin Node Capacity Init Job
+#
+# Root cause: kubectl apply does NOT update Node status subresource on
+# existing nodes.  This Job patches status.capacity / status.allocatable
+# to the correct real-hardware values so that placement-verifier test-pods
+# can actually be scheduled on the KWOK virtual nodes.
+#
+# Memory derivation (must match edge_env.py _NODE_CAP_MEM):
+#   n0, n1 (edge-nodes-1/2): 3.82 GiB = 3911 MiB  = 3911Mi
+#   n2, n3 (edge-nodes-3/4): 7.75 GiB = 7937 MiB  = 7937Mi
+#
+# CPU derivation (must match edge_env.py _NODE_CAP_CPU):
+#   n0, n2, n3: 4 cores  |  n1: 2 cores
+#
+# Apply (idempotent, safe to re-run after cluster restart):
+#   kubectl delete job kwok-capacity-init --ignore-not-found=true
+#   kubectl apply -f k8s/kwok-capacity-patch-job.yaml
+# Or use the helper script:
+#   bash k8s/scripts/patch_kwok_capacity.sh
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kwok-capacity-init
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: kwok-capacity-init
+    spec:
+      serviceAccountName: twin-sync-sa
+      restartPolicy: OnFailure
+      containers:
+      - name: patch-capacity
+        image: alpine/k8s:1.30.2
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+          echo "=== Patching KWOK twin-node capacity/allocatable ==="
+
+          kubectl patch node twin-edge-nodes-1 --subresource=status --type=merge \
+            -p '{"status":{"capacity":{"cpu":"4","memory":"3911Mi","pods":"110"},"allocatable":{"cpu":"4","memory":"3911Mi","pods":"110"}}}'
+          echo "twin-edge-nodes-1 patched (cpu=4, mem=3911Mi)"
+
+          kubectl patch node twin-edge-nodes-2 --subresource=status --type=merge \
+            -p '{"status":{"capacity":{"cpu":"2","memory":"3911Mi","pods":"110"},"allocatable":{"cpu":"2","memory":"3911Mi","pods":"110"}}}'
+          echo "twin-edge-nodes-2 patched (cpu=2, mem=3911Mi)"
+
+          kubectl patch node twin-edge-nodes-3 --subresource=status --type=merge \
+            -p '{"status":{"capacity":{"cpu":"4","memory":"7937Mi","pods":"110"},"allocatable":{"cpu":"4","memory":"7937Mi","pods":"110"}}}'
+          echo "twin-edge-nodes-3 patched (cpu=4, mem=7937Mi)"
+
+          kubectl patch node twin-edge-nodes-4 --subresource=status --type=merge \
+            -p '{"status":{"capacity":{"cpu":"4","memory":"7937Mi","pods":"110"},"allocatable":{"cpu":"4","memory":"7937Mi","pods":"110"}}}'
+          echo "twin-edge-nodes-4 patched (cpu=4, mem=7937Mi)"
+
+          echo "=== All KWOK twin nodes capacity patched OK ==="

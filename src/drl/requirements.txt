@@ -1,0 +1,9 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+redis==5.0.4
+numpy>=1.26
+gymnasium>=0.29.0
+stable-baselines3>=2.3.0
+sb3-contrib>=2.3.0
+kubernetes>=29.0
+prometheus-client>=0.20

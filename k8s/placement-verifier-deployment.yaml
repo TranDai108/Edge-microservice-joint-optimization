@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-verifier
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: placement-verifier
+  template:
+    metadata:
+      labels:
+        app: placement-verifier
+    spec:
+      serviceAccountName: placement-verifier-sa
+      nodeSelector:
+        node-role.kubernetes.io/edge: "true"
+      containers:
+      - name: verifier
+        image: 192.168.100.3:5000/drl-agent:adaptive-v14
+        imagePullPolicy: Always
+        command: ["python", "-m", "drl.placement_verifier"]
+        env:
+        # Resolve the current writable Redis primary and follow Sentinel
+        # failovers instead of retaining a plain connection to a demoted node.
+        - name: REDIS_SENTINEL_HOSTS
+          value: "redis-sentinel.default.svc.cluster.local:26379"
+        - name: REDIS_SENTINEL_MASTER
+          value: "mymaster"
+        # Plain Redis fallback when Sentinel discovery is unavailable.
+        - name: REDIS_HOST
+          value: redis.default.svc.cluster.local
+        - name: REDIS_PORT
+          value: "6379"
+        - name: VERIFIER_TIMEOUT_S
+          value: "45"
+        - name: VERIFIER_POST_TIMEOUT_SLEEP_S
+          value: "8"
+        - name: VERIFIER_POST_SYNC_SLEEP_S
+          value: "0.2"
+        - name: VERIFIER_POLL_INTERVAL_S
+          value: "0.5"
+        - name: VERIFIER_ACTIVE_MODES
+          value: "drl,hybrid"
+        - name: VERIFIER_LATEST_REHYDRATE_MAX_AGE_S
+          value: "120"
+        - name: VERIFIER_REVERIFY_SAME_FP_INTERVAL_S
+          value: "30"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name

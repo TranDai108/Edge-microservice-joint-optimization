@@ -1,0 +1,45 @@
+grafana:
+  enabled: true
+  adminPassword: "kltn1234"
+  service:
+    type: NodePort
+    nodePort: 32000
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 32090
+  prometheusSpec:
+    additionalScrapeConfigs:
+      - job_name: "kltn-pipeline"
+        static_configs:
+          - targets:
+              - "api-gateway.default.svc.cluster.local:8000"
+              - "ingest.default.svc.cluster.local:8000"
+              - "preprocess.default.svc.cluster.local:8000"
+              - "detection.default.svc.cluster.local:8000"
+              - "postprocess.default.svc.cluster.local:8000"
+        metrics_path: /metrics
+        scrape_interval: 15s
+      - job_name: "node-exporter-labeled"
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            regex: ".*node-exporter.*"
+            action: keep
+          - source_labels: [__meta_kubernetes_endpoint_node_name]
+            target_label: node
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            regex: ".*metrics.*"
+            action: keep
+        scrape_interval: 15s
+
+alertmanager:
+  enabled: false
