@@ -1,0 +1,10 @@
+{
+    "chat.mcp.serverSampling": {
+        "KLTN_project/.vscode/mcp.json: obsidian": {
+            "allowedModels": [
+                "copilot/auto",
+                "copilotcli/claude-haiku-4.5"
+            ]
+        }
+    }
+}

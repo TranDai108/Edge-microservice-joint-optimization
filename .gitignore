@@ -13,7 +13,9 @@ env/
 monitoring/venv_dashboard/
 
 # Editor settings
-.vscode/
+# Commit shared VS Code tasks, launch configurations, and MCP definitions.
+.vscode/*.local.json
+.vscode/*.private.json
 .idea/
 
 # OS junk
@@ -26,7 +28,6 @@ Thumbs.db
 
 .agents
 monitoring_runs
-tests
 
 results/
 tmp/
