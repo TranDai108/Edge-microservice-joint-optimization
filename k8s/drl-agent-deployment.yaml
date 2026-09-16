@@ -21,9 +21,8 @@ spec:
         app: drl-agent
     spec:
       serviceAccountName: milp-agent-sa
-      # Remove hard nodeName pinning; use nodeSelector + preferred anti-affinity
-      nodeSelector:
-        node-role.kubernetes.io/edge: "true"
+      # Prefer edge execution, while allowing the control plane as a recovery
+      # target when all edge nodes are unavailable.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -34,13 +33,22 @@ spec:
                   app: drl-agent
               topologyKey: kubernetes.io/hostname
         nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          # Last-resort: control-plane node if all edge nodes are unavailable
-          - weight: 1
-            preference:
-              matchExpressions:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: In
+                values: ["true"]
+            - matchExpressions:
               - key: node-role.kubernetes.io/control-plane
                 operator: Exists
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: In
+                values: ["true"]
       containers:
       - name: drl-agent
         image: 192.168.100.3:5000/drl-agent:adaptive-v16

@@ -38,6 +38,10 @@ log = logging.getLogger("k8s-client")
 NAMESPACE = "default"
 MODELED_CPU_ANNOTATION = "kltn.io/modeled-cpu"
 MODELED_MEMORY_ANNOTATION = "kltn.io/modeled-memory"
+# Read-side calls are used by the dashboard and controller reconciliation
+# loops.  They must fail promptly when an API server or an edge node is down;
+# otherwise a transient outage can stall an entire Streamlit page render.
+K8S_REQUEST_TIMEOUT_S = float(os.getenv("K8S_REQUEST_TIMEOUT_S", "3"))
 
 
 # ─── Client initialisation (cached singleton) ─────────────────────────────────
@@ -60,7 +64,11 @@ def _init_clients() -> tuple[client.CoreV1Api, client.AppsV1Api]:
         config.load_kube_config()
         log.debug("Kubernetes: loaded kubeconfig (~/.kube/config)")
 
-    return client.CoreV1Api(), client.AppsV1Api()
+    # Do not use urllib3's retry policy for control-plane reads.  Callers
+    # already refresh on a short interval and need a fast degraded response.
+    cfg.retries = 0
+    api_client = client.ApiClient(configuration=cfg)
+    return client.CoreV1Api(api_client), client.AppsV1Api(api_client)
 
 
 def _core() -> client.CoreV1Api:
@@ -101,7 +109,7 @@ def get_all_worker_nodes() -> list[str]:
     condition is not True (e.g. crashed or network-partitioned nodes).
     """
     try:
-        nodes = _core().list_node().items
+        nodes = _core().list_node(_request_timeout=K8S_REQUEST_TIMEOUT_S).items
         workers: list[str] = []
         for node in nodes:
             name = (node.metadata.name or "").strip()
@@ -133,7 +141,7 @@ def get_all_worker_nodes() -> list[str]:
 
         workers.sort()
         return workers
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not list worker nodes: {e}")
         return []
 
@@ -145,7 +153,7 @@ def get_all_worker_nodes_any_status() -> list[str]:
     that nodes which are already NotReady at pod startup are still tracked.
     """
     try:
-        nodes = _core().list_node().items
+        nodes = _core().list_node(_request_timeout=K8S_REQUEST_TIMEOUT_S).items
         workers: list[str] = []
         for node in nodes:
             name = (node.metadata.name or "").strip()
@@ -163,7 +171,7 @@ def get_all_worker_nodes_any_status() -> list[str]:
             workers.append(name)
         workers.sort()
         return workers
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not list all worker nodes: {e}")
         return []
 
@@ -173,13 +181,13 @@ def get_node_internal_ip(hostname: str) -> str | None:
     Return the InternalIP for a node hostname.
     """
     try:
-        node = _core().read_node(hostname)
+        node = _core().read_node(hostname, _request_timeout=K8S_REQUEST_TIMEOUT_S)
         for addr in node.status.addresses or []:
             if addr.type == "InternalIP" and addr.address:
                 return addr.address
         log.warning(f"  [k8s API] No InternalIP found for node {hostname}")
         return None
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not read node IP for {hostname}: {e}")
         return None
 
@@ -197,7 +205,7 @@ def get_node_capacity_cpu(hostname: str) -> float:
     Returns 2.0 as a safe fallback if the node is unreachable.
     """
     try:
-        node = _core().read_node(hostname)
+        node = _core().read_node(hostname, _request_timeout=K8S_REQUEST_TIMEOUT_S)
         raw = node.status.allocatable.get("cpu", "")
         if raw.endswith("m"):
             cap = float(raw[:-1]) / 1000.0
@@ -205,7 +213,7 @@ def get_node_capacity_cpu(hostname: str) -> float:
             cap = float(raw)
         log.debug(f"  [k8s API] {hostname} allocatable CPU: {cap} cores")
         return cap
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not read CPU capacity for {hostname}: {e}")
         return 2.0
 
@@ -222,7 +230,7 @@ def get_node_allocatable_memory(hostname: str) -> float:
     Returns 2.0 GB as a safe fallback.
     """
     try:
-        node = _core().read_node(hostname)
+        node = _core().read_node(hostname, _request_timeout=K8S_REQUEST_TIMEOUT_S)
         raw = node.status.allocatable.get("memory", "")
         if raw.endswith("Ki"):
             mem_gb = int(raw[:-2]) / 1024 / 1024
@@ -237,7 +245,7 @@ def get_node_allocatable_memory(hostname: str) -> float:
         mem_gb = round(mem_gb, 2)
         log.debug(f"  [k8s API] {hostname} allocatable RAM: {mem_gb} GB")
         return mem_gb
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not read memory for {hostname}: {e}")
         return 2.0
 
@@ -260,6 +268,7 @@ def get_pod_node(deploy_name: str, namespace: str = NAMESPACE) -> str | None:
             namespace=namespace,
             label_selector=f"app={deploy_name}",
             field_selector="status.phase=Running",
+            _request_timeout=K8S_REQUEST_TIMEOUT_S,
         )
         if pods.items:
             node = pods.items[0].spec.node_name
@@ -267,7 +276,7 @@ def get_pod_node(deploy_name: str, namespace: str = NAMESPACE) -> str | None:
             return node
         log.warning(f"  [k8s API] No running pod found for app={deploy_name}")
         return None
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not list pods for {deploy_name}: {e}")
         return None
 
@@ -290,6 +299,7 @@ def get_pod_env(deploy_name: str, namespace: str = NAMESPACE) -> list[dict]:
             namespace=namespace,
             label_selector=f"app={deploy_name}",
             field_selector="status.phase=Running",
+            _request_timeout=K8S_REQUEST_TIMEOUT_S,
         )
         if not pods.items:
             log.warning(f"  [k8s API] No running pod for {deploy_name} — env empty")
@@ -297,7 +307,7 @@ def get_pod_env(deploy_name: str, namespace: str = NAMESPACE) -> list[dict]:
         env_vars = pods.items[0].spec.containers[0].env or []
         # Convert V1EnvVar objects → plain dicts for uniform handling
         return [{"name": e.name, "value": e.value or ""} for e in env_vars]
-    except ApiException as e:
+    except Exception as e:
         log.warning(f"  [k8s API] Could not read env for {deploy_name}: {e}")
         return []
 
@@ -359,8 +369,9 @@ def get_scenario_load_by_node(
         pods = _core().list_namespaced_pod(
             namespace=namespace,
             label_selector=label_selector,
+            _request_timeout=K8S_REQUEST_TIMEOUT_S,
         ).items
-    except ApiException as e:
+    except Exception as e:
         log.warning("  [k8s API] Could not list scenario load pods: %s", e)
         return totals
 
@@ -391,7 +402,10 @@ def get_scenario_load_by_node(
             pod_cpu += parse_cpu_quantity(requests.get("cpu", "0"))
             pod_mem += parse_memory_quantity_gb(requests.get("memory", "0"))
 
-        annotations = pod.metadata.annotations or {}
+        # Kubernetes client objects normally expose ``annotations`` as ``None``
+        # when it is unset.  Keep this tolerant of lightweight API stubs as
+        # well, so a pod with no annotations still contributes its requests.
+        annotations = getattr(pod.metadata, "annotations", None) or {}
         modeled_cpu_raw = annotations.get(MODELED_CPU_ANNOTATION)
         modeled_mem_raw = annotations.get(MODELED_MEMORY_ANNOTATION)
         modeled_cpu = parse_cpu_quantity(modeled_cpu_raw) if modeled_cpu_raw else pod_cpu

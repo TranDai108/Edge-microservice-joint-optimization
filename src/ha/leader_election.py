@@ -165,7 +165,12 @@ class LeaderElector:
             coord_api.create_namespaced_lease(_LEASE_NAMESPACE, body)
             with self._lock:
                 self._is_leader = True
-                self._epoch += 1
+                # Fencing tokens must be comparable across pods.  A local
+                # counter gives every freshly-started pod epoch=1, which lets
+                # an old leader write after a failover.  Lease transitions are
+                # persisted by Kubernetes, so transitions + 1 is cluster-wide
+                # and monotonic for this Lease.
+                self._epoch = 1
             log.info(
                 "Acquired lease '%s' (epoch=%d identity=%s)",
                 self._lease_name, self._epoch, self._identity,
@@ -186,9 +191,11 @@ class LeaderElector:
             duration = spec.lease_duration_seconds or _LEASE_DURATION_S
 
             if holder == self._identity:
-                # We already hold it; treat as renewal
+                # We already hold it (for example after a container restart).
+                # Restore the fencing token from the durable Lease state.
                 with self._lock:
                     self._is_leader = True
+                    self._epoch = (spec.lease_transitions or 0) + 1
                 return
 
             if renew_time is None:
@@ -200,6 +207,11 @@ class LeaderElector:
                 now = datetime.now(timezone.utc)
                 transitions = (spec.lease_transitions or 0) + 1
                 body = k8s_client.V1Lease(
+                    metadata=k8s_client.V1ObjectMeta(
+                        name=self._lease_name,
+                        namespace=_LEASE_NAMESPACE,
+                        resource_version=lease.metadata.resource_version,
+                    ),
                     spec=k8s_client.V1LeaseSpec(
                         holder_identity=self._identity,
                         lease_duration_seconds=_LEASE_DURATION_S,
@@ -208,10 +220,15 @@ class LeaderElector:
                         lease_transitions=transitions,
                     )
                 )
-                coord_api.patch_namespaced_lease(self._lease_name, _LEASE_NAMESPACE, body)
+                # replace + resourceVersion is an optimistic compare-and-swap.
+                # If another standby observed the same expired Lease, only one
+                # replacement can win; the loser receives HTTP 409.
+                coord_api.replace_namespaced_lease(
+                    self._lease_name, _LEASE_NAMESPACE, body
+                )
                 with self._lock:
                     self._is_leader = True
-                    self._epoch += 1
+                    self._epoch = transitions + 1
                 log.info(
                     "Stole expired lease '%s' from '%s' (epoch=%d transitions=%d)",
                     self._lease_name, holder, self._epoch, transitions,
@@ -220,16 +237,43 @@ class LeaderElector:
             log.debug("Steal attempt failed: %s", exc)
 
     def _renew(self, coord_api) -> None:
+        # Never blindly patch holderIdentity.  A former leader may wake after
+        # its Lease expired and a standby took over; an unconditional patch
+        # would steal leadership back.  Read the current holder and renew with
+        # resourceVersion CAS so a concurrent takeover invalidates this write.
+        lease = coord_api.read_namespaced_lease(
+            self._lease_name, _LEASE_NAMESPACE
+        )
+        spec = lease.spec
+        if (spec.holder_identity or "") != self._identity:
+            log.warning(
+                "Lease '%s' is now held by '%s' — stepping down",
+                self._lease_name,
+                spec.holder_identity or "<none>",
+            )
+            with self._lock:
+                self._is_leader = False
+            return
+
         now = datetime.now(timezone.utc)
         body = k8s_client.V1Lease(
+            metadata=k8s_client.V1ObjectMeta(
+                name=self._lease_name,
+                namespace=_LEASE_NAMESPACE,
+                resource_version=lease.metadata.resource_version,
+            ),
             spec=k8s_client.V1LeaseSpec(
                 holder_identity=self._identity,
                 lease_duration_seconds=_LEASE_DURATION_S,
+                acquire_time=spec.acquire_time,
                 renew_time=now,
+                lease_transitions=spec.lease_transitions,
             )
         )
         try:
-            coord_api.patch_namespaced_lease(self._lease_name, _LEASE_NAMESPACE, body)
+            coord_api.replace_namespaced_lease(
+                self._lease_name, _LEASE_NAMESPACE, body
+            )
             log.debug("Renewed lease '%s'", self._lease_name)
         except k8s_client.exceptions.ApiException as exc:
             log.warning("Lease renewal failed (%s) — stepping down", exc.status)

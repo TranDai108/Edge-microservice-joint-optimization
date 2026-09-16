@@ -148,9 +148,11 @@ start() {
   (
     cd "$ROOT_DIR"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- streamlit start ---" >>"$LOG_FILE"
-    REDIS_HOST="$REDIS_HOST_VALUE" KUBECTL_BIN="$KUBECTL_BIN_VALUE" KUBECONFIG="$KUBECONFIG_VALUE" nohup $cmd run "$APP_FILE" \
+    REDIS_HOST="$REDIS_HOST_VALUE" KUBECTL_BIN="$KUBECTL_BIN_VALUE" KUBECONFIG="$KUBECONFIG_VALUE" nohup setsid $cmd run "$APP_FILE" \
       --server.port "$PORT" \
       --server.address "$HOST" \
+      --server.headless true \
+      </dev/null \
       >>"$LOG_FILE" 2>&1 &
     echo $! >"$PID_FILE"
   )

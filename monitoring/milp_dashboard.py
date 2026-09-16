@@ -203,6 +203,10 @@ SIM_RESULTS_FILE = os.getenv(
     str(Path(__file__).resolve().parent.parent / "results" / "client_results.jsonl"),
 )
 
+
+def _is_twin_node(name: str) -> bool:
+    return str(name).startswith("twin-")
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 NODE_COLORS   = {
     "edge-nodes-1": "#4C9BE8",
@@ -372,7 +376,9 @@ def _get_redis_client():
 
 def _kubectl(cmd: str, timeout: int = 6) -> str:
     try:
-        r = subprocess.run(f"{KUBECTL_BIN} {cmd}", shell=True,
+        # kubectl's own default request timeout is much longer than the UI can
+        # tolerate during an outage.  Keep every dashboard probe bounded.
+        r = subprocess.run(f"{KUBECTL_BIN} --request-timeout={timeout}s {cmd}", shell=True,
                            capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
@@ -757,14 +763,14 @@ def get_milp_weights() -> dict[str, Any]:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def get_pod_node_map() -> dict[str, str]:
-    result: dict[str, str] = {}
-    for svc in SERVICES:
-        if k8s_client:
-            n = k8s_client.get_pod_node(svc)
-            result[svc] = n or "unknown"
-        else:
-            result[svc] = "unknown"
-    return result
+    # Use the single, timeout-bounded snapshot instead of six synchronous SDK
+    # queries.  The previous approach could leave the first Streamlit render
+    # blank while the Kubernetes client retried an unreachable API server.
+    nodes_by_service: dict[str, str] = {}
+    for pod in get_cluster_state_snapshot().get("pods", []):
+        if pod.get("phase") == "Running" and pod.get("app") and pod.get("node"):
+            nodes_by_service.setdefault(str(pod["app"]), str(pod["node"]))
+    return {svc: nodes_by_service.get(svc, "unknown") for svc in SERVICES}
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -777,7 +783,7 @@ def get_cluster_state_snapshot() -> dict[str, list[dict] | float]:
         "pods": [],
     }
 
-    out_nodes = _kubectl("get nodes -o json", timeout=8)
+    out_nodes = _kubectl("get nodes -o json", timeout=3)
     if out_nodes:
         try:
             payload = json.loads(out_nodes)
@@ -792,16 +798,18 @@ def get_cluster_state_snapshot() -> dict[str, list[dict] | float]:
                     c.get("type") == "Ready" and c.get("status") == "True"
                     for c in conditions
                 )
+                node_name = item.get("metadata", {}).get("name", "")
                 snapshot["nodes"].append({
-                    "name": item.get("metadata", {}).get("name", ""),
+                    "name": node_name,
                     "ready": ready,
                     "is_worker": is_worker,
+                    "is_twin": _is_twin_node(node_name),
                     "unschedulable": bool(item.get("spec", {}).get("unschedulable", False)),
                 })
         except Exception:
             pass
 
-    out_deploy = _kubectl(f"get deployments -n {NAMESPACE} -o json", timeout=8)
+    out_deploy = _kubectl(f"get deployments -n {NAMESPACE} -o json", timeout=3)
     if out_deploy:
         try:
             payload = json.loads(out_deploy)
@@ -818,7 +826,7 @@ def get_cluster_state_snapshot() -> dict[str, list[dict] | float]:
         except Exception:
             pass
 
-    out_pods = _kubectl(f"get pods -n {NAMESPACE} -o json", timeout=8)
+    out_pods = _kubectl(f"get pods -n {NAMESPACE} -o json", timeout=3)
     if out_pods:
         try:
             payload = json.loads(out_pods)
@@ -850,7 +858,7 @@ def get_cluster_worker_nodes() -> list[str]:
     workers = [
         n.get("name", "")
         for n in snapshot.get("nodes", [])
-        if n.get("is_worker") and not n.get("unschedulable")
+        if n.get("is_worker") and not n.get("unschedulable") and not n.get("is_twin")
     ]
     workers = [w for w in workers if w]
     if workers:
@@ -1230,15 +1238,14 @@ def _status_dot(ok: bool) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_header(placement: Optional[dict]) -> None:
-    """Top KPI row: system mode + MILP + DRL key metrics."""
-    # ── System mode banner ────────────────────────────────────────────────────
+    """Top KPI row for the current control loop."""
     mode, mode_source = get_system_mode_details()
     mode_labels = {
-        "milp":    ("MILP MODE — MILP governs all placement",       "mode-milp"),
-        "shadow":  ("SHADOW MODE — DRL runs silently, MILP governs", "mode-shadow"),
-        "drl":     ("DRL MODE — DRL governs, MILP is fallback",      "mode-drl"),
-        "hybrid":  ("HYBRID MODE — DRL gated by MILP safety",        "mode-hybrid"),
-        "unknown": ("MODE UNKNOWN — check Redis system:mode",        "mode-unknown"),
+        "milp":    ("MILP mode",       "mode-milp"),
+        "shadow":  ("Shadow mode",     "mode-shadow"),
+        "drl":     ("DRL mode",        "mode-drl"),
+        "hybrid":  ("Hybrid mode",     "mode-hybrid"),
+        "unknown": ("Mode unknown",    "mode-unknown"),
     }
     label, css_cls = mode_labels.get(mode, mode_labels["unknown"])
 
@@ -1252,7 +1259,7 @@ def render_header(placement: Optional[dict]) -> None:
 
     st.markdown(
         f'<div style="margin-bottom:10px; display:flex; gap:10px; align-items:center;">'
-        f'<span class="{css_cls}">⚙ {label}</span>'
+        f'<span class="{css_cls}">{label}</span>'
         f'<span style="color:#a0aec0; font-size:0.85rem;">{last_solve} · source: {mode_source}</span>'
         f'</div>',
         unsafe_allow_html=True,
@@ -1264,7 +1271,7 @@ def render_header(placement: Optional[dict]) -> None:
     with col1:
         obj = placement.get("objective", None) if placement else None
         status = placement.get("status", "—") if placement else "—"
-        st.metric("🎯 MILP J", f"{obj:.4f}" if obj is not None else "N/A",
+        st.metric("MILP objective", f"{obj:.4f}" if obj is not None else "N/A",
                   delta=f"status: {status}", delta_color="off")
 
     # E2E latency
@@ -1274,51 +1281,29 @@ def render_header(placement: Optional[dict]) -> None:
         if lat is not None:
             if lat > SLA_LATENCY_MS:
                 delta_str = f"⚠️ SLA VIOLATED"
-            st.metric("🌐 E2E Latency", f"{lat:.1f} ms", delta=delta_str,
+            st.metric("E2E latency", f"{lat:.1f} ms", delta=delta_str,
                       delta_color="inverse" if lat > SLA_LATENCY_MS else "off")
         else:
-            st.metric("🌐 E2E Latency", "N/A", delta=delta_str, delta_color="off")
+            st.metric("E2E latency", "N/A", delta=delta_str, delta_color="off")
 
     # Detection accuracy
     with col3:
         active_var = get_active_variant()
         acc = get_detection_accuracy(active_var if active_var != "unknown" else None)
         acc_pct = f"{acc*100:.1f}%" if acc is not None else "N/A"
-        st.metric("🎯 Det. Accuracy", acc_pct, delta=f"Variant: {active_var}",
+        st.metric("Detection accuracy", acc_pct, delta=f"variant: {active_var}",
                   delta_color="off")
 
     # Migrations this cycle
     with col4:
         mig_types = placement.get("migration_types", {}) if placement else {}
         n_mig = sum(1 for v in mig_types.values() if v != "Stayed")
-        st.metric("🔀 Migrations", str(n_mig), delta="this cycle", delta_color="off")
-
-    with st.expander("Header details", expanded=False):
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st_val = placement.get("solve_time", None) if placement else None
-            st.metric("⏱ Solve Time", f"{st_val:.3f}s" if st_val is not None else "—",
-                      delta="Target < 5s", delta_color="off")
-        with d2:
-            status = placement.get("status", "—") if placement else "—"
-            icon = "🟢" if status == "optimal" else ("🟡" if status == "feasible" else "🔴")
-            st.metric("🔄 Solver", status, delta=icon, delta_color="off")
-        with d3:
-            drl_pl = get_drl_placement() or {}
-            drl_j = drl_pl.get("comparable_objective", drl_pl.get("objective"))
-            milp_j = (placement.get("objective") if placement else None)
-            if drl_j is not None and milp_j is not None and milp_j != 0:
-                gap_pct = 100 * (float(drl_j) - float(milp_j)) / abs(float(milp_j))
-                delta = f"{'+' if gap_pct >= 0 else ''}{gap_pct:.1f}% vs MILP"
-            else:
-                delta = "comparable"
-            st.metric("🤖 DRL Comparable J", f"{float(drl_j):.4f}" if drl_j is not None else "N/A",
-                      delta=delta, delta_color="off")
+        st.metric("Migrations", str(n_mig), delta="this cycle", delta_color="off")
 
 
 def render_health_bar() -> None:
     """Compact connectivity status bar."""
-    st.markdown('<p class="section-header">🔌 System Connectivity</p>',
+    st.markdown('<p class="section-header">System Connectivity</p>',
                 unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
 
@@ -1326,41 +1311,52 @@ def render_health_bar() -> None:
         rdb = _get_redis_client()
         host = st.session_state.get("redis_host_ok", "")
         if rdb:
-            st.success(f"✅ Redis `{host}:{REDIS_PORT}`")
+            st.success(f"Redis connected: `{host}:{REDIS_PORT}`")
         else:
-            st.error("❌ Redis disconnected")
+            st.error("Redis disconnected")
             st.caption("kubectl port-forward svc/redis 6379:6379")
 
     with c2:
         prom_ok = _prom("up") is not None or len(_prom_vector("up")) > 0
         if prom_ok:
-            st.success(f"✅ Prometheus `{PROM_URL.split('/api')[0].split('/')[-1]}`")
+            st.success(f"Prometheus reachable: `{PROM_URL.split('/api')[0].split('/')[-1]}`")
         else:
-            st.error("❌ Prometheus unreachable")
+            st.error("Prometheus unreachable")
 
     with c3:
         if k8s_client is None:
-            st.error(f"❌ k8s SDK: {K8S_IMPORT_ERROR[:50]}")
+            st.error(f"Kubernetes SDK unavailable: {K8S_IMPORT_ERROR[:50]}")
+        elif _kubectl("get --raw=/readyz", timeout=3).strip() == "ok":
+            st.success("Kubernetes API reachable")
         else:
-            st.success("✅ Kubernetes SDK")
+            st.error("Kubernetes API unreachable")
 
     with c4:
-        kctl = _kubectl("version --client", timeout=3)
-        if kctl:
-            st.success("✅ kubectl")
+        snapshot = get_cluster_state_snapshot()
+        nodes = snapshot.get("nodes", [])
+        edge_nodes = [n for n in nodes if n.get("name") in NODES]
+        ready = sum(1 for node in edge_nodes if node.get("ready"))
+        if edge_nodes:
+            if ready == len(edge_nodes):
+                st.success(f"Real edge nodes ready: {ready}/{len(edge_nodes)}")
+            else:
+                st.warning(f"Real edge nodes ready: {ready}/{len(edge_nodes)}")
         else:
-            st.warning("⚠️ kubectl unavailable")
+            st.error("kubectl cannot query cluster")
 
 
 def render_cluster_state_summary() -> None:
     """Compact live counts sourced directly from the Kubernetes API."""
-    st.markdown('<p class="section-header">🧭 Live Cluster State</p>',
+    st.markdown('<p class="section-header">Live Cluster State</p>',
                 unsafe_allow_html=True)
 
     snapshot = get_cluster_state_snapshot()
-    worker_nodes = [n for n in snapshot.get("nodes", []) if n.get("is_worker")]
-    ready_workers = sum(1 for n in worker_nodes if n.get("ready"))
-    total_workers = len(worker_nodes)
+    edge_nodes = [n for n in snapshot.get("nodes", []) if n.get("name") in NODES]
+    ready_edges = sum(1 for n in edge_nodes if n.get("ready"))
+    total_edges = len(edge_nodes)
+
+    twin_nodes = [n for n in snapshot.get("nodes", []) if n.get("is_twin")]
+    ready_twins = sum(1 for n in twin_nodes if n.get("ready"))
 
     deployments = snapshot.get("deployments", [])
     dep_ready = sum(dep.get("ready", 0) for dep in deployments)
@@ -1369,25 +1365,27 @@ def render_cluster_state_summary() -> None:
     pods = snapshot.get("pods", [])
     pod_total = len(pods)
     pod_running = sum(1 for p in pods if p.get("phase") == "Running")
-    pod_pending = sum(1 for p in pods if p.get("phase") in {"Pending", "Unknown"})
-    pod_failed = sum(1 for p in pods if p.get("phase") in {"Failed", "CrashLoopBackOff"})
+    pod_problem = sum(1 for p in pods if p.get("phase") != "Running")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("🖥 Worker Nodes", f"{ready_workers}/{total_workers}",
+        st.metric("Real edge nodes", f"{ready_edges}/{total_edges}",
                   delta="Ready/Total")
     with c2:
-        st.metric("📦 Deployments", f"{dep_ready}/{dep_desired}",
-                  delta="Ready/Desired replicas")
+        st.metric("Twin nodes", f"{ready_twins}/{len(twin_nodes)}",
+                  delta="Ready/Total")
     with c3:
-        st.metric("🧩 Pods", f"{pod_running}/{pod_total}",
-                  delta="Running/Total")
+        st.metric("Deployments", f"{dep_ready}/{dep_desired}",
+                  delta="Ready/Desired replicas")
     with c4:
-        st.metric("⚠️ Non-Running Pods", str(pod_pending + pod_failed),
-                  delta=f"Pending:{pod_pending} Failed:{pod_failed}")
+        st.metric("Pipeline pods", f"{pod_running}/{pod_total}",
+                  delta="Running/Total")
 
     synced_at = _fmt_ts(snapshot.get("timestamp", time.time()), "%H:%M:%S (GMT+7)")
-    st.caption(f"Synced from cluster API at {synced_at} (namespace={NAMESPACE})")
+    caption = f"Synced from cluster API at {synced_at} (namespace={NAMESPACE})"
+    if pod_problem:
+        caption += f" · {pod_problem} non-running pod(s) in this namespace"
+    st.caption(caption)
 
 
 def render_node_resources() -> None:
@@ -1574,6 +1572,42 @@ def render_node_resources() -> None:
             st.plotly_chart(fig, use_container_width=True, key=f"node_res_bar_{node}", config={"displayModeBar": False})
 
         st.divider()
+
+
+def render_compact_node_table(pod_node_map: dict[str, str]) -> None:
+    """Small real-edge-node table for the default overview."""
+    st.markdown('<p class="section-header">Real Edge Nodes</p>',
+                unsafe_allow_html=True)
+
+    snapshot = get_cluster_state_snapshot()
+    node_state = {n.get("name"): n for n in snapshot.get("nodes", [])}
+    services_by_node: dict[str, list[str]] = {node: [] for node in NODES}
+    for svc, node in pod_node_map.items():
+        if node in services_by_node:
+            services_by_node[node].append(svc)
+
+    rows: list[dict[str, Any]] = []
+    for node in NODES:
+        cap_cpu = get_node_capacity_cpu(node)
+        cap_mem = get_node_capacity_mem(node)
+        cpu_util = get_node_cpu_util(node)
+        mem_used = get_node_mem_used_gb(node)
+        mem_pct = (mem_used / cap_mem * 100.0) if mem_used is not None and cap_mem else None
+        plat_w = get_kepler_node_watts(node)
+        dram_w = get_kepler_dram_watts(node)
+        ready = bool((node_state.get(node) or {}).get("ready", False))
+
+        rows.append({
+            "Node": node,
+            "Ready": "yes" if ready else "no",
+            "CPU": f"{cpu_util * 100:.1f}%" if cpu_util is not None else "N/A",
+            "RAM": f"{mem_pct:.1f}%" if mem_pct is not None else "N/A",
+            "Power": f"{plat_w:.1f} W" if plat_w is not None else "N/A",
+            "DRAM": f"{dram_w:.1f} W" if dram_w is not None else "N/A",
+            "Services": ", ".join(services_by_node.get(node, [])) or "-",
+        })
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 
@@ -2791,76 +2825,51 @@ def _render_weight_editor() -> None:
 
 def render_sidebar() -> tuple[bool, int]:
     with st.sidebar:
-        st.image("https://raw.githubusercontent.com/FortAwesome/Font-Awesome/6.x/svgs/solid/microchip.svg",
-                 width=40)
         st.title("MILP Control")
-        st.caption("Edge Computing Dashboard")
+        st.caption("Edge cluster dashboard")
         st.divider()
 
-        auto = st.checkbox("🔄 Auto-refresh", value=True)
+        auto = st.checkbox("Auto-refresh", value=True)
         interval = st.slider("Refresh interval (s)", 5, 60, 15)
 
-        if st.button("🔄 Force Refresh Now"):
+        if st.button("Refresh now"):
             st.cache_data.clear()
             st.rerun()
 
         st.divider()
-        st.subheader("🔧 Quick Actions")
-
-        st.subheader("🤖 DRL Mode")
-        current_mode = get_system_mode()
-        mode_css = {"milp": "mode-milp", "shadow": "mode-shadow",
-                    "hybrid": "mode-hybrid", "drl": "mode-drl", "unknown": "mode-unknown"}
-        st.markdown(
-            f'<span class="{mode_css.get(current_mode, "mode-unknown")}">{current_mode.upper()}</span>',
-            unsafe_allow_html=True,
-        )
-        for btn_label, btn_mode in [("Set MILP", "milp"),
-                                     ("Set Shadow", "shadow"),
-                                     ("Set Hybrid", "hybrid"),
-                                     ("Set DRL", "drl")]:
-            if st.button(btn_label, key=f"sb_mode_{btn_mode}",
-                         type="primary" if current_mode == btn_mode else "secondary"):
-                rdb = _get_redis_client()
-                if rdb:
-                    rdb.set("system:mode", btn_mode)
-                    st.cache_data.clear()
-                    st.rerun()
-                else:
-                    st.error("Redis unavailable")
-
-        st.divider()
-        if st.button("📊 Redis → Placement JSON"):
-            raw = _kubectl(f"exec deploy/redis -n {NAMESPACE} -- redis-cli GET milp:placement")
-            if raw:
-                try:
-                    st.json(json.loads(raw))
-                except Exception:
-                    st.code(raw)
-            else:
-                st.error("No data")
-
-        if st.button("🔄 Clear Metric Cache"):
-            st.cache_data.clear()
-            st.success("Cache cleared, refreshing…")
-            time.sleep(0.5)
-            st.rerun()
-
-        st.divider()
-        st.subheader("⚙️ Control Parameters")
-        st.markdown(f"**Control Interval:** `{CONTROL_INTERVAL} s`")
-        st.markdown(f"**SLA Latency:** `{SLA_LATENCY_MS} ms`")
-        st.markdown(f"**Solver Timeout:** `{SOLVER_TIMEOUT_S} s`")
-        st.markdown(f"**Max Fallback Ratio:** `{MAX_FALLBACK_RATIO}`")
+        with st.expander("Mode control", expanded=False):
+            current_mode = get_system_mode()
+            mode_css = {"milp": "mode-milp", "shadow": "mode-shadow",
+                        "hybrid": "mode-hybrid", "drl": "mode-drl", "unknown": "mode-unknown"}
+            st.markdown(
+                f'<span class="{mode_css.get(current_mode, "mode-unknown")}">{current_mode.upper()}</span>',
+                unsafe_allow_html=True,
+            )
+            for btn_label, btn_mode in [("Set MILP", "milp"),
+                                         ("Set Shadow", "shadow"),
+                                         ("Set Hybrid", "hybrid"),
+                                         ("Set DRL", "drl")]:
+                if st.button(btn_label, key=f"sb_mode_{btn_mode}",
+                             type="primary" if current_mode == btn_mode else "secondary"):
+                    rdb = _get_redis_client()
+                    if rdb:
+                        rdb.set("system:mode", btn_mode)
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("Redis unavailable")
 
         st.divider()
         _render_weight_editor()
 
         st.divider()
-        st.subheader("📡 Prometheus Links")
-        base = PROM_URL.replace("/api/v1/query", "")
-        st.markdown(f"[Open Prometheus UI]({base})")
-        st.markdown(f"[Node CPU query]({base}/graph?g0.expr=1+-+avg(rate(node_cpu_seconds_total[60s])))")
+        with st.expander("Runtime settings", expanded=False):
+            st.markdown(f"**Control interval:** `{CONTROL_INTERVAL} s`")
+            st.markdown(f"**SLA latency:** `{SLA_LATENCY_MS} ms`")
+            st.markdown(f"**Solver timeout:** `{SOLVER_TIMEOUT_S} s`")
+            st.markdown(f"**Max fallback ratio:** `{MAX_FALLBACK_RATIO}`")
+            base = PROM_URL.replace("/api/v1/query", "")
+            st.markdown(f"[Open Prometheus UI]({base})")
 
         st.divider()
         st.caption(f"MILP Control v2.0 · {_fmt_ts(time.time(), '%H:%M:%S')} (GMT+7, Hanoi)")
@@ -2888,7 +2897,7 @@ def main() -> None:
     pod_node_map = get_pod_node_map()
 
     # ── Header ───────────────────────────────────────────────────────────────
-    st.title("🤖 MILP + DRL Edge Control — Cluster Dashboard")
+    st.title("MILP + DRL Edge Control")
     render_header(placement)
     st.divider()
 
@@ -2898,19 +2907,23 @@ def main() -> None:
 
     # ── Main tabs ─────────────────────────────────────────────────────────────
     tab_overview, tab_placement, tab_solver, tab_drl, tab_pods, tab_logs = st.tabs([
-        "🌐 System Overview",
-        "📍 Workloads & Placement",
-        "📐 MILP Solver & QoS",
-        "🤖 DRL & Twin",
-        "🖥 Pods",
-        "📋 Logs",
+        "Overview",
+        "Placement",
+        "Solver & QoS",
+        "DRL & Twin",
+        "Pods",
+        "Logs",
     ])
 
     with tab_overview:
         render_cluster_state_summary()
-        render_node_resources()
-        render_energy_panel()
-        render_oversubscription(placement, pod_node_map)
+        render_placement_table(placement, confirmed, pod_node_map)
+        render_compact_node_table(pod_node_map)
+        with st.expander("Detailed node resources", expanded=False):
+            render_node_resources()
+        with st.expander("Energy and CPU pressure diagnostics", expanded=False):
+            render_energy_panel()
+            render_oversubscription(placement, pod_node_map)
 
     with tab_placement:
         if controller_sync:
@@ -2929,7 +2942,8 @@ def main() -> None:
     with tab_solver:
         render_objective_panel(placement)
         render_detection_qos()
-        render_simulator_pipeline()
+        with st.expander("Simulator pipeline details", expanded=False):
+            render_simulator_pipeline()
 
     with tab_drl:
         render_drl_tab(placement)

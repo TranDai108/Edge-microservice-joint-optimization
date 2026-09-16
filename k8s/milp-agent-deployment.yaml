@@ -25,10 +25,8 @@ spec:
         app: milp-agent
     spec:
       serviceAccountName: milp-agent-sa
-      # Remove hard nodeName pinning — use nodeSelector with preferred fallback
-      # so the scheduler can place standby pods on any available edge node.
-      nodeSelector:
-        node-role.kubernetes.io/edge: "true"
+      # Run on edge nodes when possible, but keep the control plane eligible so
+      # the control loop can recover when every edge node is unavailable.
       affinity:
         podAntiAffinity:
           # Strong preference: spread replicas across different nodes to
@@ -41,14 +39,22 @@ spec:
                   app: milp-agent
               topologyKey: kubernetes.io/hostname
         nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          # Last-resort fallback: allow control-plane node if no edge node
-          # is available, keeping controller availability during edge failures.
-          - weight: 1
-            preference:
-              matchExpressions:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: In
+                values: ["true"]
+            - matchExpressions:
               - key: node-role.kubernetes.io/control-plane
                 operator: Exists
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: In
+                values: ["true"]
       containers:
       - name: milp-agent
         image: 192.168.100.3:5000/milp-agent:latest
